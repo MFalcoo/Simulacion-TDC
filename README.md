@@ -1,3 +1,4 @@
+Sistema de Control de Lazo Cerrado para Control de temperatura en servidores - Simulación
 Requisitos
 Python
 Las siguientes bibliotecas de Python:
@@ -7,7 +8,7 @@ Instalación
 Paso 1: Clonar el repositorio
 Abrir una consola de git bash y ejecutar el siguiente comando:
 
-git clone https://github.com/tomasmartinez02/Simulacion-TDC.git
+git clone https://github.com/MFalcoo/Simulacion-TDC.git
 Paso 2: Instalar Python
 Descargar desde python.org. Durante la instalación, agregar Python a la variable de entorno PATH.
 
