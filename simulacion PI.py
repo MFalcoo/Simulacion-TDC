@@ -2,13 +2,13 @@
 """
 Simulación: Control de Temperatura en Data Center (lazo cerrado)
 Planta térmica + actuador HVAC (1er orden) + sensor (1er orden)
-+ Control PI (+ feedforward opcional)
+Control PI (P + I discreto con anti-windup) + feedforward opcional.
 
 Qué graficamos:
-1) Temperatura real de sala vs. medida vs. setpoint
+1) Temperatura real vs. medida vs. setpoint
 2) Potencia de frío (comando y efectiva)
-3) Carga térmica (kW) y temperatura ambiente
-4) Error de control y umbrales
+3) Carga térmica y temperatura ambiente
+4) Error y umbrales
 
 Autor: (tu nombre)
 """
@@ -16,216 +16,224 @@ Autor: (tu nombre)
 import numpy as np
 import matplotlib.pyplot as plt
 
-# ==========================
-# Parámetros "de TP"
-# ==========================
+# ============================================================
+# 1) PARÁMETROS BÁSICOS DE TIEMPO
+# ============================================================
 
-# Tiempo de muestreo y duración
-Ts = 30.0                   # [s] muestreo
-T_total = 6_000.0           # [s] ~100 min
+Ts = 30.0          # [s] tiempo de muestreo
+T_total = 6_000.0  # [s] duración total (~100 min)
 N = int(T_total / Ts)
 
-# Setpoint y entorno
-T_ref = 24.0                # [°C] consigna
-T_amb_base = 28.0           # [°C] temperatura ambiente base (sala externa)
+t = np.arange(N) * Ts   # eje de tiempo [s]
 
-# Planta térmica (primer orden)
-tau_th = 300.0              # [s] constante de tiempo térmica de sala (≈5 min)
-Kh = 0.0002                 # [°C/(kW·s)] efecto de carga térmica integrada
-Kc_th = -0.00035            # [°C/(kW·s)] efecto de HVAC (negativo: más frío → baja T)
+# ============================================================
+# 2) SETPOINT FIJO 
+# ============================================================
 
-# Actuador HVAC (primer orden)
-tau_act = 60.0              # [s] inercia del actuador/compresor/ventiladores
-U_max = 100.0               # [kW] potencia de frío máxima
-U_min = 0.0                 # [kW]
-use_feedforward = True      # feedforward basado en q(t)
+T_ref = 24.0              # [°C] setpoint fijo
+T_ref_profile = np.full(N, T_ref)
 
-# Sensor (primer orden)
-tau_sens = 60.0             # [s] retardo/filtrado del sensor
+# ============================================================
+# 3) PLANTA, ACTUADOR, SENSOR
+# ============================================================
 
-# Controlador PI (e = T_ref - T_meas)
-# e > 0 → sala "fría" respecto a consigna → hay que bajar el frío ⇒ Kp, Ki negativos
-Kp = -2.0                   # [kW/°C]
-Ki = -0.004                 # [kW/(°C·s)]  <-- ajustable
-I_min, I_max = -50.0, 50.0  # límites al término integral (anti-windup simple)
+T_amb_base = 28.0         # [°C] temperatura ambiente base
 
-# Umbrales de “estado operativo” (solo para graficar)
-e_low  = 0.5                # [°C] ±0.5 (zona normalidad)
+tau_th  = 300.0           # [s] constante de tiempo térmica (~5 min)
+Kh      = 0.0002          # [°C/(kW·s)]
+Kc_th   = -0.00035        # [°C/(kW·s)]
+
+tau_act = 60.0            # [s]
+U_max   = 100.0           # [kW]
+U_min   = 0.0             # [kW]
+
+tau_sens = 60.0           # [s] retardo del sensor
+
+# ============================================================
+# 4) CONTROLADOR PI DISCRETO
+# ============================================================
+
+Kp = -2.0         # Proporcional (e>0 => se reduce el frío)
+Ti = 600.0        # [s] tiempo integral
+Ki = Kp / Ti      # continuo
+Ki_d = Ki * Ts    # discreto
+
+e_low  = 0.5
 e_mid  = 1.5
 e_high = 3.0
 
-# ==========================
-# Escenarios / señales externas
-# ==========================
+use_feedforward = True
 
-# Carga térmica nominal (promedio) y variaciones
-q_nom = 25.0                # [kW] carga base (servidores)
-q_spread = 0.10             # +/-10% aleatorio
+# ============================================================
+# 5) CARGA TÉRMICA Y PERTURBACIONES — Interactivo 
+# ============================================================
 
-# Perturbaciones de carga (picos tipo “DoS térmico”): (instante, +kW, duración en pasos)
-heat_spikes = [
-    (40,  +20.0, 3),        # ~ 20 min: +20 kW por 3 muestras
-    (55,  +25.0, 3),        # ~ 27.5 min
-    (70,  +30.0, 3),        # ~ 35 min
-]
+q_nom = 25.0
+q_spread = 0.10
 
-# Perturbación de ambiente (ola de calor / falla ventilación): (instante, +°C, duración en pasos)
-ambient_spikes = [
-    (20, +2.0, 3),          # ~ 10 min
-    (85, +3.0, 4),          # ~ 42.5 min
-]
+# Valores por defecto
+heat_amp = 20.0
+heat_dur = 3
+heat_t_min = 20.0
 
-# ==========================
-# Helpers de perturbaciones
-# ==========================
+amb_amp = 2.0
+amb_dur = 3
+amb_t_min = 50.0
 
-def build_profile(N, base, spikes, Ts, is_heat=True):
-    """Devuelve una señal de longitud N con base y eventos tipo 'spike'."""
-    sig = np.full(N, base, dtype=float)
-    for (t_idx, inc, dur) in spikes:
-        t_idx = int(t_idx)  # índice en muestras
-        t_end = min(N, t_idx + int(dur))
-        sig[t_idx:t_end] += inc
-    if is_heat:
-        # ruido/microvariación para q(t)
-        rnd = 1.0 + q_spread * (2.0*np.random.rand(N) - 1.0)
-        sig *= rnd
-        sig = np.clip(sig, 0.0, None)
-    return sig
+# --- Interactivo ---
+try:
+    ans2 = input("¿Querés configurar perturbaciones manualmente? (s/n) [n]: ").strip().lower()
+except EOFError:
+    ans2 = "n"
 
-# Perfiles discretos:
-q_profile = build_profile(N, q_nom, heat_spikes, Ts, is_heat=True)             # [kW]
-Tamb_profile = build_profile(N, T_amb_base, ambient_spikes, Ts, is_heat=False) # [°C]
+if ans2 == "s":
+    try:
+        heat_amp = float(input("Pico de carga térmica [kW] (ej 20): ") or heat_amp)
+        heat_dur = int(input("Duración pico carga [muestras] (ej 3): ") or heat_dur)
+        heat_t_min = float(input("Inicio pico carga [min] (ej 20): ") or heat_t_min)
 
-# ==========================
-# Simulación
-# ==========================
+        amb_amp = float(input("Pico de temperatura ambiente [°C] (ej 2): ") or amb_amp)
+        amb_dur = int(input("Duración pico ambiente [muestras] (ej 3): ") or amb_dur)
+        amb_t_min = float(input("Inicio pico ambiente [min] (ej 50): ") or amb_t_min)
+    except ValueError:
+        print("Entrada inválida, se usan parámetros por defecto.")
 
-# Estados
-T = np.zeros(N)             # [°C] temperatura de sala (real)
-T_meas = np.zeros(N)        # [°C] temperatura medida (sensor)
-u_cmd = np.zeros(N)         # [kW] comando del controlador PI (+ feedforward)
-u_eff = np.zeros(N)         # [kW] potencia de frío efectiva (salida del actuador)
-e = np.zeros(N)             # [°C] error
-I = np.zeros(N)             # término integral del PI
-zones = []                  # zona de error (NORMAL / BAJO / MEDIO / ALTO)
+k_heat = int((heat_t_min * 60.0) / Ts)
+k_amb  = int((amb_t_min * 60.0) / Ts)
 
-# Inicialización
-T[0] = max(T_ref, T_amb_base + 1.0)   # arrancamos un poco por arriba del SP
+def build_profile_load():
+    q = np.full(N, q_nom, dtype=float)
+    # Ruido térmico de servers
+    rnd = 1.0 + q_spread * (2.0*np.random.rand(N) - 1.0)
+    q *= rnd
+    # pico
+    if 0 <= k_heat < N:
+        q[k_heat:k_heat+heat_dur] += heat_amp
+    return np.clip(q, 0.0, None)
+
+def build_profile_ambient():
+    Tamb = np.full(N, T_amb_base, dtype=float)
+    if 0 <= k_amb < N:
+        Tamb[k_amb:k_amb+amb_dur] += amb_amp
+    return Tamb
+
+q_profile = build_profile_load()
+Tamb_profile = build_profile_ambient()
+
+# ============================================================
+# 6) VARIABLES DE ESTADO
+# ============================================================
+
+T      = np.zeros(N)
+T_meas = np.zeros(N)
+u_cmd  = np.zeros(N)
+u_eff  = np.zeros(N)
+e      = np.zeros(N)
+Iterm  = np.zeros(N)
+
+T[0] = max(T_ref, T_amb_base + 1.0)
 T_meas[0] = T[0]
 u_eff[0] = 0.0
 
-for k in range(1, N):
-    # Señales externas
-    qk = q_profile[k]            # [kW]
-    Tamb_k = Tamb_profile[k]     # [°C]
+# ============================================================
+# 7) SIMULACIÓN
+# ============================================================
 
-    # Dinámica del sensor (1er orden hacia T)
+for k in range(1, N):
+
+    # Sensor
     if tau_sens > 0:
-        T_meas[k] = T_meas[k-1] + (Ts/tau_sens)*(T[k-1] - T_meas[k-1])
+        T_meas[k] = T_meas[k-1] + (Ts / tau_sens) * (T[k-1] - T_meas[k-1])
     else:
         T_meas[k] = T[k-1]
 
     # Error
     e[k] = T_ref - T_meas[k]
 
-    # Zona/umbrales (logging)
-    ae = abs(e[k])
-    if ae <= e_low:
-        zone = "NORMAL"
-    elif ae <= e_mid:
-        zone = "BAJO"
-    elif ae <= e_high:
-        zone = "MEDIO"
-    else:
-        zone = "ALTO"
-    zones.append(zone)
-
-    # Feedforward: compensar aproximadamente la carga térmica qk
+    # Feedforward
+    qk = q_profile[k]
+    Tamb_k = Tamb_profile[k]
     u_ff = qk if use_feedforward else 0.0
 
-    # --- Control PI ---
-    # Parte proporcional
-    P = Kp * e[k]
+    # PI sin saturar
+    u_unsat = u_ff + Kp * e[k] + Iterm[k-1]
 
-    # Parte integral (sumador de Euler)
-    I[k] = I[k-1] + Ki * e[k] * Ts
+    # Saturación
+    u_sat = np.clip(u_unsat, U_min, U_max)
 
-    # Anti-windup: limitar el término integral
-    I[k] = np.clip(I[k], I_min, I_max)
+    # Anti-windup
+    if U_min < u_unsat < U_max:
+        Iterm[k] = Iterm[k-1] + Ki_d * e[k]
+    else:
+        Iterm[k] = Iterm[k-1]
 
-    # Comando "sin límites" (feedforward + PI)
-    u_cmd_raw = u_ff + P + I[k]
+    u_cmd[k] = u_sat
 
-    # Refuerzo de compresor si el error es muy grande
-    comp_on = (ae > e_high)
-    if comp_on:
-        u_cmd_raw = max(u_cmd_raw, 0.8 * U_max)
-
-    # Saturación física del actuador
-    u_cmd[k] = np.clip(u_cmd_raw, U_min, U_max)
-
-    # Dinámica del actuador (1er orden hacia u_eff)
+    # Actuador
     if tau_act > 0:
-        u_eff[k] = u_eff[k-1] + (Ts/tau_act) * (u_cmd[k] - u_eff[k-1])
+        u_eff[k] = u_eff[k-1] + (Ts / tau_act) * (u_cmd[k] - u_eff[k-1])
     else:
         u_eff[k] = u_cmd[k]
 
-    # Dinámica térmica de la sala (Euler hacia adelante)
-    # dT/dt = -(T - Tamb)/tau_th + Kh*qk + Kc_th*u_eff
-    dT = (-(T[k-1] - Tamb_k)/tau_th + Kh*qk + Kc_th*u_eff[k]) * Ts
+    # Dinámica térmica
+    dT = (-(T[k-1] - Tamb_k) / tau_th + Kh * qk + Kc_th * u_eff[k]) * Ts
     T[k] = T[k-1] + dT
 
-# ==========================
-# Reporte por consola
-# ==========================
-print("----- Resumen de simulación -----")
-print(f"Muestras: {N}  |  Ts = {Ts:.1f} s  |  Duración = {N*Ts/60:.1f} min")
-print(f"Setpoint: {T_ref:.1f} °C  |  Umax = {U_max:.1f} kW")
-print(f"Ganancias PI: Kp = {Kp:.3f}, Ki = {Ki:.5f}")
-print(f"Planta: tau_th = {tau_th:.1f} s, Kh = {Kh:.5f}, Kc_th = {Kc_th:.5f}")
-print(f"Actuador: tau_act = {tau_act:.1f} s  |  Sensor: tau_sens = {tau_sens:.1f} s")
+# ============================================================
+# 8) REPORT
+# ============================================================
 
-# ==========================
-# Gráficos para el informe
-# ==========================
+print("----- Resumen -----")
+print(f"Setpoint fijo: {T_ref:.1f} °C")
+print(f"Kp = {Kp}, Ti = {Ti} s")
+print(f"Perturbación térmica: +{heat_amp} kW en t ≈ {heat_t_min} min")
+print(f"Perturbación ambiente: +{amb_amp} °C en t ≈ {amb_t_min} min")
 
-t = np.arange(N) * Ts
+# ============================================================
+# 9) GRÁFICOS
+# ============================================================
 
 plt.figure(figsize=(12, 9))
 
+# 1) Temperatura
 plt.subplot(4,1,1)
-plt.plot(t, T, label='T sala (real)')
-plt.plot(t, T_meas, linestyle='--', label='T medida (sensor)')
-plt.axhline(T_ref, linestyle=':', label='Setpoint')
-plt.ylabel('Temperatura [°C]')
-plt.title('Temperatura de sala vs. medida')
+plt.plot(t, T, label='T real')
+plt.plot(t, T_meas, '--', label='T medida')
+plt.plot(t, T_ref_profile, ':', label='Setpoint 24°C')
+plt.ylabel('°C')
+plt.title('Temperatura de sala')
 plt.grid(True); plt.legend()
 
+# 2) Control
 plt.subplot(4,1,2)
-plt.plot(t, u_cmd, label='u_cmd (kW)')
-plt.plot(t, u_eff, linestyle='--', label='u_eff (kW)')
-plt.ylabel('Potencia de frío [kW]')
-plt.title('Acción de control (comando vs. efectiva)')
+plt.plot(t, u_cmd, label='u_cmd')
+plt.plot(t, u_eff, '--', label='u_eff')
+plt.ylabel('kW')
+plt.title('Acción de control')
 plt.grid(True); plt.legend()
 
+# 3) Perturbaciones
 plt.subplot(4,1,3)
-plt.plot(t, q_profile, label='Carga térmica q(t) [kW]')
-plt.plot(t, Tamb_profile, linestyle='--', label='T_amb(t) [°C]')
-plt.ylabel('q [kW] / T_amb [°C]')
-plt.title('Perturbaciones: carga térmica y ambiente')
+plt.plot(t, q_profile, label='Carga térmica [kW]')
+plt.plot(t, Tamb_profile, '--', label='T_amb [°C]')
+plt.ylabel('q / Tamb')
+plt.title('Perturbaciones')
 plt.grid(True); plt.legend()
 
+# 4) Error
 plt.subplot(4,1,4)
-plt.plot(t, e, label='Error e(t) = Tref - Tmeas')
-plt.axhline(+e_low, linestyle=':', label='±0.5 °C'); plt.axhline(-e_low, linestyle=':')
-plt.axhline(+e_mid, linestyle=':'); plt.axhline(-e_mid, linestyle=':')
-plt.axhline(+e_high, linestyle=':'); plt.axhline(-e_high, linestyle=':')
+plt.plot(t, e, label='Error')
+plt.axhline(+e_low, linestyle=':')
+plt.axhline(-e_low, linestyle=':')
+plt.axhline(+e_mid, linestyle=':')
+plt.axhline(-e_mid, linestyle=':')
+plt.axhline(+e_high, linestyle=':')
+plt.axhline(-e_high, linestyle=':')
 plt.xlabel('Tiempo [s]')
-plt.ylabel('Error [°C]')
-plt.title('Error de control y umbrales')
+plt.ylabel('°C')
+plt.title('Error de control')
 plt.grid(True); plt.legend()
 
 plt.tight_layout()
-plt.savefig('sim_dc_control_PI.png', dpi=160)
+plt.savefig("sim_dc_PI_final.png", dpi=170)
 plt.show()
